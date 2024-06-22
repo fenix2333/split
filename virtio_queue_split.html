@@ -1,0 +1,756 @@
+`ifndef VIRTIO_QUEUE_SV
+`define VIRTIO_QUEUE_SV
+
+`ifndef print_error
+    `define print_error(msg_str) $display("ERROR: %s @0t [%m Line: %0d]",msg_str. $realtime,`__FILE__,`__LINE__);
+`endif
+`ifndef print_error
+    `define print_warning(msg_str) $display("Warning: %s @0t [%m Line: %0d]",msg_str. $realtime,`__FILE__,`__LINE__);
+`endif
+
+//-----------------------
+// RING_QUEUE_C
+//-----------------------
+class ring_queue_c;
+    string name;
+    int unsigned q_size;
+    int unsigned total_slot;
+    int unsigned w_ptr;
+    int unsigned r_ptr;
+
+    function new(string name, int unsigned q_size);
+        this.name = name;
+        this.q_size = q_size;
+        total_slot = q_size - 1;
+        w_ptr = 0;
+        r_ptr = 0;
+    endfunction
+
+    function bit is_empty();
+        if(w_ptr == r_ptr)
+            return 1;
+        else
+            return 0;
+    endfunction    
+
+    function bit is_full();
+        if(valid_slot() == total_slot)
+            return 1;
+        else
+            return 0;
+    endfunction  
+
+    function int unsigned valid_slot();
+        if(w_ptr >= r_ptr)
+            return w_ptr - r_ptr;
+        else
+            return q_size + w_ptr - r_ptr;
+    endfunction      
+
+    function int unsigned empty_slot();
+        return total_slot - valid_slot();
+    endfunction 
+
+    function bit put_one();
+        if(empty_slot() == 0) begin
+            `print_error($sformatf("[%s] queue is empty when put_one()", name))
+            return 0;
+        end
+        w_ptr = w_ptr + 1;
+        if(w_ptr == q_size) begin
+            w_ptr = 0;
+            return 1;
+        end
+    endfunction
+
+    function bit get_one();
+        if(valid_slot() == 0) begin
+            `print_error($sformatf("[%s] queue is empty when get_one()", name))
+            return 0;
+        end
+        r_ptr = r_ptr + 1;
+        if(r_ptr == q_size) begin
+            r_ptr = 0;
+            return 1;
+        end
+    endfunction
+
+endclass : ring_queue_c
+
+//-----------------------
+//struct for virtio_queue
+//-----------------------
+typedef struct {
+    bit [63:0] addr;
+    bit [31:0] len;
+    bit [15:0] flags;
+    bit [15:0] next;
+} vring_desc_s;
+
+typedef struct {
+    bit [15:0] flags;
+    bit [15:0] isx;
+    bit [15:0] ring[];
+    bit [15:0] used_event;
+} vring_avail_s;
+
+typedef struct {
+    bit [31:0] id;
+    bit [31:0] len;
+} vring_used_elem_s;
+
+typedef struct {
+    bit [15:0] flags;
+    bit [15:0] idx;
+    vring_used_elem_s ring[];   // 注意先后顺序，先写elem
+    bit [15:0] avail_event;
+} vring_used_s;
+
+typedef struct {
+    vring_desc_s  desc[];
+    vring_avail_s avail;
+    bit [7:0]     pad;
+    vring_used_s  used;
+} vring_s;
+
+//-----------------------
+// class virtio_queue_c
+//-----------------------
+typedef enum bit[1:0] {RX_VQUEUE=2'h0,TX_VQUEUE=2'h1,CTRL_VQUEUE=2'h2} VQUEUE_TYPE;
+typedef bit[7:0] byte_queue_t[];
+
+class virtio_queue_c;
+    string name;
+    VQUEUE_TYPE   vq_type;
+    int unsigned  dev_id;
+    int unsigned  vf_id;
+    int unsigned  qp_id;
+    int unsigned  qp_idx;
+    int unsigned  q_size;
+    int unsigned  vq_len;
+    bit [63:0]    vq_addr;
+    vring_s       ring;
+    bit [ 7:0]    byte_q[];    
+	/// host_memory_c
+    int unsigned  data_buf_size;
+    ring_queue_c  used_ring_flag;
+    byte_queue_t  pkt_q[$];
+    global_config cfg;     //// global_config
+
+    bit [7:0]    current_pkt_byte_q[$];
+    int unsigned current_pkt_buf_num;
+    int unsigned current_pkt_buf_idx;
+    rand int unsigned next_kick_for_rx;  ///inside {[4:20]}
+
+    semaphore sem;
+    bit desc_used_flag[];
+
+    bit [63:0]  vring_desc_base_addr;
+    bit [63:0]  vring_desc_max_addr;
+    bit [63:0]  vring_avail_base_addr;
+    bit [63:0]  vring_avail_max_addr;
+    bit [63:0]  vring_pad_base_addr;    
+    bit [63:0]  vring_pad_max_addr;
+    bit [63:0]  vring_used_base_addr;
+    bit [63:0]  vring_used_max_addr;
+
+    //-----------------------
+    // new
+    //-----------------------
+    function new(VQUEUE_TYPE vqueue_type,
+                 int unsigned _dev_id,
+                 int unsigned _vf_id,
+                 int unsigned queuepair_id,
+                 int unsigned queuepair_idx,
+                 bit [63:0]   queue_addr,
+                 global_config cfg);
+
+        vq_type = vqueue_type;
+        dev_id  = _dev_id;
+        vf_id   = _vf_id;
+        qp_id   = queuepair_id;
+        qp_idx  = queuepair_idx;
+        vq_addr = queue_addr;
+        this.cfg = cfg;
+        //mem ;
+        name = $sformatf("DEV%02d_vf%02d_%s%02d/%0d", dev_id,vf_id,vq_type.name,qp_id,qp_idx);
+
+        sem = new(1);
+        pkt_q.delete();
+        current_pkt_byte_q.delete();
+        current_pkt_buf_num = 0;
+        current_pkt_buf_idx = 0;
+    endfunction : new
+
+    //-----------------------
+    // initial_vq data_buf_size
+    //-----------------------
+    task initial_vq();
+        bit status;
+        bit [63:0] buf_addr;
+		// memory_block_s
+
+        this.randomize();
+
+        q_size = cfg.queue_size;
+        data_buf_size = cfg.buf_size[dev_id * TB_DEV_NUM + vf_id];
+
+        used_ring_flag   = new(name,q_size);
+        desc_used_flag   = new[q_size];
+        vring.desc       = new[q_size];
+        vring.avail.ring = new[q_size];
+        vring.used.ring  = new[q_size];
+
+        vring_desc_base_addr  = vq_addr;
+        vring_desc_max_addr   = vring_desc_base_addr +(16*q_size - 1);
+        vring_avail_base_addr = vring_desc_max_addr + 1;
+        vring_avail_max_addr  = vring_avail_base_addr +(6+2*q_size-1);
+        vring_pad_base_addr   = vring_avail_max_addr + 1;
+        if(vring_pad_base_addr[11:0] == 0) begin  // is align 4k
+            vring_pad_max_addr   = vring_pad_base_addr;
+            vring_used_base_addr = vring_pad_max_addr + 1;
+            vring_used_max_addr  = vring_used_base_addr +(6+8*q_size-1);
+        end
+        else begin
+            vring_pad_max_addr   = vring_pad_base_addr;
+            vring_pad_max_addr[11: 0] = 0;
+            vring_pad_max_addr[63:12] += 1; 
+            vring_pad_max_addr -= 1;
+            vring_used_base_addr = vring_pad_max_addr + 1;
+            vring_used_max_addr  = vring_used_base_addr +(6+8*q_size-1); 
+            vring.pad = new[vring_used_base_addr - vring_pad_base_addr];          
+        end
+
+        vq_len = vring_used_max_addr - vring_desc_base_addr + 1;
+        if(testbench.dis_lvl>1) $display("INFO,%0s initial: buffer size=%0d",name,data_buf_size);
+
+        // initial queue
+        vring.avail.idx = 0;
+
+        if(vq_type==RX_VQUEUE) begin
+            foreach(vring.desc[i]) begin
+                buf_addr = (vq_addr | 64'h8000_0000) + i*data_buf_size;
+                ///allocate_mem
+
+                vring.desc[i].addr  = mem.addr;
+                vring.desc[i].len   = mem.len;
+                vring.desc[i].flags = VRING_DESC_F_WRITE;
+                vring.desc[i].next  = 'h0;   
+                desc_used_flag[i]   = 1;
+
+                vring.avail.ring[i] = i;           
+            end
+            vring.avail.idx = q_size;
+        end
+        else begin
+            foreach(desc_used_flag[i]) desc_used_flag[i] = 0;
+        end
+
+        assert(vq_addr[1:0] == 0);
+        ///allocate_mem
+
+		///write_to_mem();
+    endtask : initial_vq
+
+    //-----------------------
+    // pack
+    //-----------------------
+    function void pack();
+        int unsigned byte_q_idx;
+
+        byte_q = new[vq_len];
+        byte_q_len = 0;
+
+        /// desc
+        foreach(vring.desc[i]) begin
+            byte_q[byte_q_idx++] = vring.desc[i].addr [ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [15: 8];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [23:16];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [31:24];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [39:32];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [47:40];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [55:48];
+            byte_q[byte_q_idx++] = vring.desc[i].addr [63:56];
+            byte_q[byte_q_idx++] = vring.desc[i].len  [ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[i].len  [15: 8];
+            byte_q[byte_q_idx++] = vring.desc[i].len  [23:16];
+            byte_q[byte_q_idx++] = vring.desc[i].len  [31:24];
+            byte_q[byte_q_idx++] = vring.desc[i].flags[ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[i].flags[15: 8];
+            byte_q[byte_q_idx++] = vring.desc[i].next [ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[i].next [15: 8];
+        end
+
+        /// avail
+        byte_q[byte_q_idx++] = vring.avail.flags[ 7: 0];
+        byte_q[byte_q_idx++] = vring.avail.flags[15: 8];
+        byte_q[byte_q_idx++] = vring.avail.idx  [ 7: 0];
+        byte_q[byte_q_idx++] = vring.avail.idx  [15: 8];        
+        foreach(vring.avail.ring[i]) begin
+            byte_q[byte_q_idx++] = vring.avail.ring[i][ 7: 0];
+            byte_q[byte_q_idx++] = vring.avail.ring[i][15: 8];
+        end
+        byte_q[byte_q_idx++] = vring.avail.used_event[ 7: 0];
+        byte_q[byte_q_idx++] = vring.avail.used_event[15: 8];
+        
+        /// pad
+        foreach(vring.pad[i]) begin
+            byte_q[byte_q_idx++] = vring.pad[i];
+        end        
+ 
+        /// used
+        byte_q[byte_q_idx++] = vring.used.flags[ 7: 0];
+        byte_q[byte_q_idx++] = vring.used.flags[15: 8];
+        byte_q[byte_q_idx++] = vring.used.idx  [ 7: 0];
+        byte_q[byte_q_idx++] = vring.used.idx  [15: 8];        
+        foreach(vring.used.ring[i]) begin
+            byte_q[byte_q_idx++] = vring.used.ring[i]id [ 7: 0];
+            byte_q[byte_q_idx++] = vring.used.ring[i]id [15: 8];
+            byte_q[byte_q_idx++] = vring.used.ring[i]id [23:16];
+            byte_q[byte_q_idx++] = vring.used.ring[i]id [31:24];
+            byte_q[byte_q_idx++] = vring.used.ring[i]len[ 7: 0];
+            byte_q[byte_q_idx++] = vring.used.ring[i]len[15: 8];
+            byte_q[byte_q_idx++] = vring.used.ring[i]len[23:16];
+            byte_q[byte_q_idx++] = vring.used.ring[i]len[31:24];
+        end
+        byte_q[byte_q_idx++] = vring.used.avail_event[ 7: 0];
+        byte_q[byte_q_idx++] = vring.used.avail_event[15: 8];
+    endfunction : pack
+
+
+    //-----------------------
+    // unpack
+    //-----------------------
+    function void unpack();
+        int unsigned byte_q_idx;
+
+        byte_q_len = 0;
+
+        /// desc
+        foreach(vring.desc[i]) begin
+            vring.desc[i].addr [ 7: 0] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [15: 8] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [23:16] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [31:24] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [39:32] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [47:40] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [55:48] = byte_q[byte_q_idx++];
+            vring.desc[i].addr [63:56] = byte_q[byte_q_idx++];
+            vring.desc[i].len  [ 7: 0] = byte_q[byte_q_idx++];
+            vring.desc[i].len  [15: 8] = byte_q[byte_q_idx++];
+            vring.desc[i].len  [23:16] = byte_q[byte_q_idx++];
+            vring.desc[i].len  [31:24] = byte_q[byte_q_idx++];
+            vring.desc[i].flags[ 7: 0] = byte_q[byte_q_idx++];
+            vring.desc[i].flags[15: 8] = byte_q[byte_q_idx++];
+            vring.desc[i].next [ 7: 0] = byte_q[byte_q_idx++];
+            vring.desc[i].next [15: 8] = byte_q[byte_q_idx++];
+        end
+
+        /// avail
+        vring.avail.flags[ 7: 0] = byte_q[byte_q_idx++];
+        vring.avail.flags[15: 8] = byte_q[byte_q_idx++];
+        vring.avail.idx  [ 7: 0] = byte_q[byte_q_idx++];
+        vring.avail.idx  [15: 8] = byte_q[byte_q_idx++];        
+        foreach(vring.avail.ring[i]) begin
+            vring.avail.ring[i][ 7: 0] = byte_q[byte_q_idx++];
+            vring.avail.ring[i][15: 8] = byte_q[byte_q_idx++];
+        end
+        vring.avail.used_event[ 7: 0] = byte_q[byte_q_idx++];
+        vring.avail.used_event[15: 8] = byte_q[byte_q_idx++];
+        
+        /// pad
+        foreach(vring.pad[i]) begin
+            vring.pad[i] = byte_q[byte_q_idx++];
+        end        
+ 
+        /// used
+        vring.used.flags[ 7: 0] = byte_q[byte_q_idx++];
+        vring.used.flags[15: 8] = byte_q[byte_q_idx++];
+        vring.used.idx  [ 7: 0] = byte_q[byte_q_idx++];
+        vring.used.idx  [15: 8] = byte_q[byte_q_idx++];        
+        foreach(vring.used.ring[i]) begin
+            vring.used.ring[i]id [ 7: 0] = byte_q[byte_q_idx++];
+            vring.used.ring[i]id [15: 8] = byte_q[byte_q_idx++];
+            vring.used.ring[i]id [23:16] = byte_q[byte_q_idx++];
+            vring.used.ring[i]id [31:24] = byte_q[byte_q_idx++];
+            vring.used.ring[i]len[ 7: 0] = byte_q[byte_q_idx++];
+            vring.used.ring[i]len[15: 8] = byte_q[byte_q_idx++];
+            vring.used.ring[i]len[23:16] = byte_q[byte_q_idx++];
+            vring.used.ring[i]len[31:24] = byte_q[byte_q_idx++];
+        end
+        vring.used.avail_event[ 7: 0] = byte_q[byte_q_idx++];
+        vring.used.avail_event[15: 8] = byte_q[byte_q_idx++];
+    endfunction : unpack
+
+    //-----------------------
+    // when find a free desc, 
+    // return the index of desc, 
+    // otherwise return -1
+    //----------------------- 
+    function int _find_next_free_desc();
+        int idx;
+        idx = -1;
+        if(desc_used_flag.and() == 1)
+            return -1;
+        if(cfg.features[dev_id * TB_DEV_NUM + vf_id] && (~VIRTIO_F_IN_ORDER)) begin
+            int qi[$];
+            qi.delete();
+            qi = desc_used_flag.find_index with (item == 0);
+            qi.shuffle(); /// 乱序
+            idx = qi[0];
+        end
+        else begin
+            foreach(desc_used_flag[i]) begin
+                if(desc_used_flag[i] == 0) begin
+                    idx = i;
+                    break;
+                end
+            end
+        end
+        return idx;
+    endfunction :  _find_next_free_desc
+
+    function int find_next_free_desc();
+        int timeout_cnt;
+        timeout_cnt = 0;
+        do begin
+            idx = _find_next_free_desc();
+            if(idx != -1) begin
+                break;
+            end
+
+            #10000;
+            `print_warning($sformatf("%s wait desc free: %0d", name ,timeout_cnt))
+            resease_buf();
+
+            timeout_cnt++;
+            if(timeout_cnt > 100) begin
+                `print_error($sformatf("%s wait desc free timeout", name))
+                break;
+            end
+        end while(idx == -1);       
+    endfunction : find_next_free_desc
+    //-----------------------
+    function int _find_next_next_free_desc();
+        int qi[$];
+        int qi_tmp[$];
+        int idx;
+        bit first_flag;
+
+        qi.delete();
+        idx = -1;
+        first_flag = 0;
+
+        qi     = desc_used_flag.find_index with (item == 0); 
+        qi_tmp = qi.find_index with (item == last_free_desc);  
+        if (qi_tmp.size() > 0) qi.delete(qi_tmp[0]);
+        if (qi.size() == 0)    return -1;
+
+        if(cfg.features[dev_id * TB_DEV_NUM + vf_id] && (~VIRTIO_F_IN_ORDER)) begin
+            qi.shuffle(); 
+            idx = qi[0];
+        end
+        else begin
+            foreach(desc_used_flag[i]) begin
+                if(desc_used_flag[i] == 0) begin
+                    if(first_flag == 0) begin /// the first empty desc
+                        first_flag = 1;
+                    end
+                    else begin /// the second empty desc
+                        idx = i;
+                        break;
+                    end
+                end
+            end
+        end
+        return idx; 
+    endfunction :  _find_next_next_free_desc
+
+    function int find_next_next_free_desc();
+        int timeout_cnt;
+
+        timeout_cnt = 0;
+        do begin
+            idx = _find_next_next_free_desc();
+            if(idx != -1) begin
+                break;
+            end
+
+            #10000;
+            `print_warning($sformatf("%s wait desc free: %0d", name ,timeout_cnt))
+            resease_buf();
+
+            timeout_cnt++;
+            if(timeout_cnt > 100) begin
+                `print_error($sformatf("%s wait desc free timeout", name))
+                break;
+            end
+        end while(idx == -1);       
+    endfunction : find_next_next_free_desc
+
+    //-----------------------
+    // _release_one_buf
+    //-----------------------     
+    task automatic _release_one_buf();
+        bit status;
+        int unsigned byte_q_idx;
+        int unsigned ring_idx;    
+        vring_desc_s desc;    
+
+        if(desc_used_flag[desc_idx] == 0) begin
+            `print_error($sformatf("%s desc[%0d] is empty when release", name, dexc_idx))   
+        end         
+
+        desc = vring.desc[desc_idx];
+        ///release_mem
+            desc_used_flag[desc_idx] = 0;
+        end
+    endtask : _release_one_buf
+    //-----------------------
+    // release_buf: 根据已用环
+    // vring.used.idx释放描述符buf
+    //----------------------- 
+    task automatic release_buf();
+        bit status;
+        int unsigned ring_idx;    
+        bit [15:0] desc_idx;  
+
+        sem.get(1);
+        ///read_from_mem();  // update vring.used
+        used_ring_flag.w_ptr = vring.used.idx % q_size;
+
+        /// Note
+        if(vq_type == RX_VQUEUE) begin /// 如果是接收队列，vring.used.ring 存的是desc chain每一个element
+            while(used_ring_flag.valid_slot() > 0) begin
+                int unsigned buf_len;
+                byte_queue_t tmp_data_q;
+
+                // get the desc header
+                ring_idx = used_ring_flag.r_ptr;
+                used_ring_flag.get_one();
+
+                desc_idx = vring.used.ring[ring_idx].id[15:0];
+                `uvm_info("desc_idx int value", $sformatf("ring_idx=%0d vring.used.ring=%0p", ring_idx, vring.used.ring[ring_idx]) , UVM_HIGH)
+                buf_len = vring.used.ring[ring_idx].len;
+                assert(buf_len <= vring.used.ring[ring_idx].len);
+
+                if(buf_len !=0) begin
+                    //read_mem
+                    _release_one_buf(desc_idx);           
+                end
+                else begin
+                    $display("used_ring.buf_len=0");
+                    break;
+                end
+                $display("used_ring");
+
+                if(current_pkt_buf_num == 0) begin
+                    int unsigned hdr_header_len;
+                    hdr_header_len = (cfg.features[dev_id*TB_DEV_NUM+vf_id] & VIRTIO_NET_F_MRG_RXBUF) ? 12:10;
+
+                    if(hdr_header_len == 12)
+                        current_pkt_buf_num = {tmp_data_q[11], tmp_data_q[10]};
+                    else
+                        current_pkt_buf_num = 1;
+                end
+
+                foreach(tmp_data_q[i]) begin
+                    current_pkt_byte_q.push_back(tmp_data_q[i]);
+                end
+
+                current_pkt_buf_num++;
+
+                if(current_pkt_buf_idx == current_pkt_buf_num) begin
+                    byte_queue_t pkt_data;
+
+                    pkt_data = new[current_pkt_byte_q.size()];
+                    foreach(pkt_data[i])  pkt_data[i] = current_pkt_byte_q[i];
+                    pkt_q.push_back(pkt_data);
+
+                    current_pkt_byte_q.delete();
+                    current_pkt_buf_num = 0;
+                    current_pkt_buf_idx = 0;
+                end
+
+                /// 重新分配新的desc到接收队列的可用环
+                begin
+                    bit [63:0] buf_addr;
+                    //memory_block;
+                    int unsigned byte_q_idx;
+
+                    find_next_free_desc(desc_idx);
+
+                    if(desc_idx != -1) begin
+                        ///create buf
+                        buf_addr = vq_addr | 64'h8000_0000;
+                        //allocate_mem
+
+                        /// update desc
+                        if(status) begin
+                            desc_used_flag[desc_idx] = 1;
+
+                            vring.desc[desc_idx].addr  = mem.addr;
+                            vring.desc[desc_idx].len   = mem.len;
+                            vring.desc[desc_idx].flags = VRING_DESC_F_WRITE;
+                            vring.desc[desc_idx].next  = 'h0;
+
+                            byte_q = new[16];
+                            byte_q_idx = 0;
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [ 7: 0];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [15: 8];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [23:16];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [31:24];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [39:32];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [47:40];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [55:48];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [63:56];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [ 7: 0];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [15: 8];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [23:16];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [31:24];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].flags[ 7: 0];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].flags[15: 8];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].next [ 7: 0];
+                            byte_q[byte_q_idx++] = vring.desc[desc_idx].next [15: 8];
+
+                            /// write this desc into mem
+                            //write_mem
+
+                            /// update avail.ring
+                            ring_idx = vring.avail.idx % q_size;
+                            vring.avail.ring[ring_idx] = desc_idx;
+
+                            /// write avail into mem
+                            ///write16bit
+
+                            vring.avail.idx++;
+                            ///write16bit
+
+                            testbench.host_axil_m.host_kick_msg(qp_idx << 1 | KICK_RX, (dev_id & 'h3F) << 8 | (vf_id & 'hFF));
+                        end /// if(status)                    
+                    end /// if(desc_idx != -1)
+                end /// 重新分配新的desc到接收队列的可用环
+            end /// while(used_ring_flag.valid_slot() > 0)
+            else begin /// 如果不是接收队列， vring.used.ring 存的是 desc chain header
+                while(used_ring_flag.valid_slot() > 0) begin
+                    int unsigned desc_chain_id_q[$];     
+                    
+                    desc_chain_id_q.delete();
+
+                    // get the desc header
+                    ring_idx = used_ring_flag.r_ptr;
+                    used_ring_flag.get_one();
+
+                    desc_idx = vring.used.ring[ring_idx].id[15:0];
+                    `uvm_info("desc_idx int value", $sformatf("ring_idx=%0d vring.used.ring=%0p", ring_idx, vring.used.ring[ring_idx]) ,UVM_HIGH)
+                    desc_chain_id_q.push_back(desc_idx);
+
+                    `uvm_info("virtio_queue", $sformatf("desc_idx int value %0d", desc_idx) ,UVM_HIGH) 
+
+                    while(vring.desc[desc_idx].flags & VRING_DESC_F_NEXT) begin
+                        desc_idx = vring.desc[desc_idx].next;
+                        desc_chain_id_q.push_back(desc_idx);
+                        `uvm_info("virtio_queue", $sformatf("desc_idx=%0d vring.desc=%0p", desc_idx, vring.desc[desc_idx]) ,UVM_HIGH)                    
+                    end
+
+                    foreach( desc_chain_id_q[i]) begin
+                        desc_idx = desc_chain_id_q[i];
+                        if(vring.used.ring[ring_idx].len != 0) begin
+                            _release_one_buf(desc_idx);
+                            break;
+                        end
+                    end
+                    desc_chain_id_q.delete();
+                end
+            end
+        end
+        sem.put(1);  
+    endtask : release_buf
+
+    //-----------------------
+    // add_buf_chain_for_tx
+    //-----------------------     
+    task automatic add_buf_chain_for_tx(bit [15:0] flags_q[]//*mem*/ );
+        bit status;
+        int desc_idx;   
+        int desc_next_idx;
+        int unsigned byte_q_idx;   
+        int unsigned ring_idx; 
+        bit [15:0] chain_header;   
+        int desc_idx_q[$]; 
+        
+        desc_idx_q.delete();
+        assert(vq_type != RX_VQUEUE);
+
+        for(int blk_idx = 0; blk_idx < mem.size(); blk_idx++) begin
+            if(blk_idx == 0) /// the first one
+                find_next_free_desc(desc_idx);
+            if(blk_idx < (mem.size() - 1 )) /// is not the last one
+                find_next_next_free_desc(desc_idx, desc_next_idx);    
+            else
+                desc_next_idx = -1;
+
+            if(blk_idx == 0) begin
+                chain_header = desc_idx;
+            end
+            sem.get(1);
+            desc_used_flag[desc_idx] = 1;
+
+            /// write buf into mem
+
+            // update desc
+            vring.desc[desc_idx].addr = mem[blk_idx].addr;
+            vring.desc[desc_idx].len = mem[blk_idx].len;
+            if(blk_idx < (mem.size() - 1 )) begin/// is not the last one
+                vring.desc[desc_idx].flags = ((blk_idx < flags_q.size()) ? flags_q[blk_idx] :0) | VRING_DESC_F_NEXT;
+                vring.desc[desc_idx].next = desc_next_idx;
+            end
+            else begin
+                vring.desc[desc_idx].flags = ((blk_idx < flags_q.size()) ? flags_q[blk_idx] :0) & (~VRING_DESC_F_NEXT);
+                vring.desc[desc_idx].next = 0;
+            end
+
+`uvm_info("add_tx", $sformatf("desc_idx=%0d vring.desc[desc_idx]=%0p blk_idx=%0d mem[blk_idx]=%0p", desc_idx, vring.desc[desc_idx],blk_idx,mem[blk_idx]) ,UVM_HIGH)              
+
+            byte_q = new[16];
+            byte_q_idx = 0;
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [15: 8];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [23:16];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [31:24];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [39:32];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [47:40];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [55:48];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].addr [63:56];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [15: 8];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [23:16];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].len  [31:24];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].flags[ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].flags[15: 8];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].next [ 7: 0];
+            byte_q[byte_q_idx++] = vring.desc[desc_idx].next [15: 8];            
+
+            /// write this desc into mem
+
+            if(blk_idx == (mem.size() - 1 )) begin// is the last one,update avail
+                // update avail
+                ring_idx = vring.avail.idx % q_size;
+                vring.avail.ring[ring_idx] = chain_header;
+
+                /// write avail into mem       
+
+                vring.avail.idx++;
+                /// write avail into mem 16bit
+            end
+
+            desc_idx_q.push_back(desc_idx);
+            desc_idx = desc_next_idx;
+
+            sem.put(1);
+        end
+    endtask : add_buf_chain_for_tx
+endclass : ring_queue_c
+
+
+`endif /// VIRTIO_QUEUE_SV
